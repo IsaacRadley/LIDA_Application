@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SED Two-Component Power Law Fitting via MCMC
+============================================
+Fits a two-component power law model to spectral energy distribution (SED)
+data using the MCMC sampler emcee. The two components represent:
+
+- Component 1 (beta1): ionised gas emission 
+- Component 2 (beta2): thermal dust emission 
+
+Outputs per object:
+- Walker chain plots            (<obj>_chains.pdf)
+- Corner plots                  (<obj>_cornerplot.pdf / .jpg)
+- Posterior realisation plots   (<obj>_posterior_realisations.pdf / .jpg)
+
+Overall Output:
+- Compiled spectral index CSV   (outfile)
+
+Dependencies
+------------
+numpy, matplotlib, scipy, pandas, astropy, emcee, corner, multiprocessing
+
+Author
+------
+Isaac Radley
+January 2024
+"""
+
+import os
+import pickle
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import astropy.units as u
+import corner
+import emcee
+from multiprocessing import Pool
+from scipy.optimize import minimize
+from astropy.table import Table
+from IPython.display import display, Math
+
+# =============================================================================
+# Plotting configuration
+# =============================================================================
+ 
+plt.close('all')
+plt.rcParams.update({'font.size': 12})
+plt.rcParams['font.family'] = 'Nimbus Roman'
+ 
+ 
+# =============================================================================
+# Model and likelihood functions
+# =============================================================================
+ 
+def power_law_spectrum_2d(
+    log_freq: np.ndarray,
+    A1: float, beta1: float,
+    A2: float, beta2: float):
+    """
+    Compute a two-component power law SED model in log-log space.
+ 
+    Parameters
+    ----------
+    log_freq : np.ndarray
+        log10 of frequency in GHz.
+    A1 : float
+        Amplitude of the ionised gas component.
+    beta1 : float
+        Spectral index of the ionised gas component.
+    A2 : float
+        Amplitude of the thermal dust component.
+    beta2 : float
+        Spectral index of the thermal dust component.
+ 
+    Returns
+    -------
+    np.ndarray
+        log10 of the total modelled flux density in mJy.
+    """
+    freq = 10 ** log_freq / 10.
+
+    return np.log10(A1 * (freq ** beta1) + A2 * (freq ** beta2))
+ 
+ 
+def log_likelihood_log_powerlaw_2d(theta: tuple):
+    """
+    Log-likelihood for the two-component power law model in log-log space.
+ 
+    Assumes Gaussian uncertainties on log flux. Uses globally defined
+    log_freq, log_flux, and log_eflux arrays.
+ 
+    Parameters
+    ----------
+    theta : tuple
+        Model parameters (A1, beta1, A2, beta2).
+ 
+    Returns
+    -------
+    float
+        Log-likelihood value.
+    """
+    A1, beta1, A2, beta2 = theta
+ 
+    model_all = power_law_spectrum_2d(log_freq, A1, beta1, A2, beta2)
+ 
+    return -0.5 * np.sum((log_flux - model_all)**2 / log_eflux**2)
+ 
+ 
+def log_prior_powerlaw_2d(theta: tuple):
+    """
+    Log-prior for the two-component power law model.
+ 
+    Applies uniform (flat) priors within physically motivated bounds
+    that separate the ionised gas (beta1) and thermal dust (beta2)
+    contributions. Returns 0.0 if within bounds, -inf otherwise.
+ 
+    Prior bounds
+    ------------
+    A1    : (0.0, 1.4)   — scaling amplitude 1
+    beta1 : (-2.0, 1.5)  — ionised gas spectral index
+    A2    : (0.0, 1.4)   — scaling amplitude 2
+    beta2 : (1.5, 3.8)   — dust spectral index
+ 
+    Parameters
+    ----------
+    theta : tuple
+        Model parameters (A1, beta1, A2, beta2).
+ 
+    Returns
+    -------
+    float
+        0.0 if parameters are within prior bounds, -np.inf otherwise.
+    """
+    A1, beta1, A2, beta2 = theta
+ 
+    if 0.0 < A1 < 1.4 and -2 < beta1 < 1.5 and 0.0 < A2 < 1.4 and 1.5 < beta2 < 3.8:
+        return 0.0
+ 
+    return -np.inf
+ 
+ 
+def log_probability_powerlaw_2d(theta: tuple):
+    """
+    Log-posterior for the two-component power law model.
+ 
+    Combines log-prior and log-likelihood. Returns -inf immediately
+    if the prior is not finite (i.e. parameters are out of bounds).
+ 
+    Parameters
+    ----------
+    theta : tuple
+        Model parameters (A1, beta1, A2, beta2).
+ 
+    Returns
+    -------
+    float
+        Log-posterior value.
+    """
+    lp = log_prior_powerlaw_2d(theta)
+ 
+    if not np.isfinite(lp):
+        return -np.inf
+ 
+    return lp + log_likelihood_log_powerlaw_2d(theta)
+ 
+ 
+# =============================================================================
+# Configuration
+# =============================================================================
+ 
+# -- Path to CSV containing all object names
+objfile = ''  
+ 
+# -- Path to CSV containing initial parameter estimates from curve fitting
+initfile = ''   
+ 
+# -- Root output directory (one subdirectory will be created per object)
+dir = ''        
+ 
+# -- Directory containing per-object SED flux CSV
+fluxdir = ''   
+ 
+# -- Path for the compiled spectral index output CSV
+outfile = ''    
+
+# -- Number of walkers used in MCMC fitting
+nwalker = 32
+
+# -- Number of iterations to remove in burn in
+burn = 1500
+ 
+ 
+# =============================================================================
+# Main fitting loop
+# =============================================================================
+
+def main():
+    """
+    Run the two-component power law MCMC fitting pipeline for all objects.
+ 
+    For each object in the sample:
+      1. Loads SED flux data and initial parameter estimates.
+      2. Performs maximum likelihood estimation (MLE) via L-BFGS-B.
+      3. Runs emcee MCMC sampling, initialised around the MLE solution.
+      4. Saves chain plots, corner plots, and posterior realisation plots.
+      5. Compiles median spectral indices and amplitudes into an output CSV.
+    """
+ 
+    # -- All detections in our sample
+    allobjs = pd.read_csv(objfile, encoding='ISO-8859-1')
+ 
+    objects = allobjs["Object"].unique()
+ 
+    # -- Remove VLA1623A as a single object (keeping individual AaAb components)
+    objects = np.delete(objects, 1)
+ 
+    # -- Initial parameter estimates from prior curve fitting
+    cf_initial = pd.read_csv(initfile)
+ 
+    # -- Simplification factor for log-space error propagation: log10(e)
+    ln_log = np.log10(np.exp(1))
+ 
+    # -- Flag: 0 = new MCMC run, 1 = load existing run from file
+    new = 0
+ 
+    # -- Number of MCMC steps per walker
+    runs = int(1e5)
+ 
+    # -- Initialise output array (first row removed after loop)
+    out = np.zeros((1, 9))
+ 
+    for obj in objects:
+ 
+        # -- Close all open plots after each object
+        plt.close('all')
+ 
+        # -- Create output directory for this object if it does not exist
+        if os.path.isdir(dir + obj) != True:
+            os.mkdir(dir + obj)
+ 
+        os.chdir(dir + obj)
+ 
+        # -- Set MCMC backend filename
+        if new == 0:
+            file_EMCEE_2pl = obj + '_EMCEE_powerlaw.h5'
+            os.system("rm -r " + str(file_EMCEE_2pl))
+        else:
+            file_EMCEE_2pl = obj + '_EMCEE_powerlaw.h5'
+ 
+        # -- Load and clean SED flux data for this object
+        f = pd.read_csv(fluxdir + str(obj) + '_SED_fluxes.csv')
+        f = f.dropna(subset={"F_int", "F_int_err"})
+ 
+        # -- Extract initial parameter estimates for this object
+        init = cf_initial[cf_initial["Obj"] == obj]
+ 
+        table = f
+ 
+        # -- Standardise units
+        freq = table['Freq'].values * u.GHz
+        flux = table['F_int'].values * u.mJy
+        eflux = table['F_int_err'].values * u.mJy
+ 
+        # -- Convert to log-space for fitting
+        global log_freq, log_flux, log_eflux
+        log_freq = np.log10(freq.to(u.GHz).value)
+        log_flux = np.log10(flux.to(u.mJy).value)
+        log_eflux = ln_log * eflux / flux
+ 
+        # -------------------------------------------------------------------------
+        # Maximum likelihood estimation — minimise negative log-likelihood
+        # -------------------------------------------------------------------------
+ 
+        # -- Prior bounds consistent with log_prior_powerlaw_2d
+        bounds = [(0, 1.4), (-2, 1.5), (0, 1.4), (1.5, 3.8)]
+ 
+        nll = lambda *args: -log_likelihood_log_powerlaw_2d(*args)
+ 
+        # -- Initial parameter vector from curve fit estimates
+        initial = np.array([
+            init["A1"].values[0],
+            init["b1"].values[0],
+            init["A2"].values[0],
+            init["b2"].values[0]
+        ])
+ 
+        soln_log_2powlaw = minimize(nll, initial, method='L-BFGS-B', bounds=bounds)
+ 
+        # -------------------------------------------------------------------------
+        # MCMC run with emcee
+        # -------------------------------------------------------------------------
+ 
+        # -- Initialise 32 walkers around the MLE solution with small scatter
+        pos = soln_log_2powlaw.x + 1e-3 * np.random.randn(nwalker, np.size(soln_log_2powlaw.x))
+ 
+        nwalkers, ndim = pos.shape
+ 
+        with Pool() as pool:
+ 
+            if os.path.isfile(file_EMCEE_2pl):
+                # -- Load existing chain from HDF5 backend (read-only)
+                sampler = emcee.backends.HDFBackend(file_EMCEE_2pl, read_only=True)
+ 
+            else:
+                # -- Initialise backend and run sampler
+                backend = emcee.backends.HDFBackend(file_EMCEE_2pl)
+                backend.reset(nwalkers, ndim)
+ 
+                sampler = emcee.EnsembleSampler(
+                    nwalkers, ndim, log_probability_powerlaw_2d,
+                    backend=backend, pool=pool
+                )
+ 
+                sampler.run_mcmc(pos, runs, progress=True)
+ 
+                emcee.backends.HDFBackend(file_EMCEE_2pl, read_only=True)
+ 
+        # -------------------------------------------------------------------------
+        # Chain plots
+        # -------------------------------------------------------------------------
+ 
+        fig, axes = plt.subplots(4, figsize=(10, 7), sharex=True)
+ 
+        samples = sampler.get_chain()
+ 
+        labels = [r"$A_1$", r"$\beta_1$", r"$A_2$", r"$\beta_2$"]
+ 
+        for i in range(ndim):
+            ax = axes[i]
+            ax.plot(samples[:, :, i], "k", alpha=0.3)
+            ax.set_xlim(0, len(samples))
+            ax.set_ylabel(labels[i])
+            ax.yaxis.set_label_coords(-0.1, 0.5)
+ 
+        axes[-1].set_xlabel("step number")
+ 
+        fig.savefig(obj + '_chains.pdf', bbox_inches='tight')
+ 
+        # -------------------------------------------------------------------------
+        # Autocorrelation time and thinning
+        # -------------------------------------------------------------------------
+ 
+        tau = sampler.get_autocorr_time()
+ 
+        # -- Thin by the largest integrated autocorrelation time
+        act = int(tau.max())
+ 
+        # -- Discard burn-in samples and flatten the chain
+        flat_samples_2pl = sampler.get_chain(discard=burn, thin=act, flat=True)
+ 
+        # -------------------------------------------------------------------------
+        # Corner plots
+        # -------------------------------------------------------------------------
+ 
+        fig_my = plt.figure(figsize=(6.5, 7))
+ 
+        fig = corner.corner(
+            flat_samples_2pl,
+            labels=labels,
+            quantiles=[0.16, 0.5, 0.84],
+            show_titles=False,
+            bins=100, fig=fig_my, color='k'
+        )
+ 
+        soln_log_2powlaw_EMCEE = []
+ 
+        for i in range(ndim):
+            mcmc = np.percentile(flat_samples_2pl[:, i], [16, 50, 84])
+            q = np.diff(mcmc)
+            txt = r"\mathrm{{{3}}} = {0:.2f}_{{-{1:.2f}}}^{{{2:.2f}}}"
+            txt = txt.format(mcmc[1], q[0], q[1], labels[i])
+            display((txt))
+            soln_log_2powlaw_EMCEE.append(mcmc[1])
+            if i == 1:
+                label_beta = r'$\propto k^{'
+                label_beta = label_beta + '{0:.2f}_{{-{1:.2f}}}^{{{2:.2f}}}'.format(mcmc[1], q[0], q[1]) + '}$'
+ 
+        fig.savefig(obj + '_cornerplot.pdf', bbox_inches='tight')
+        fig.savefig(obj + '_cornerplot.jpg', bbox_inches='tight')
+ 
+        # -------------------------------------------------------------------------
+        # Posterior realisation plot
+        # -------------------------------------------------------------------------
+ 
+        fig, ax = plt.subplots(figsize=(5, 4))
+
+		# -- Overlay observed data
+        ax.errorbar(log_freq, log_flux, yerr=log_eflux,
+                    alpha=0.5, markeredgecolor='k',
+                    label=obj, fmt="o")
+ 		
+		# -- Sample between minimum and maximum for posterior draws
+        x_sample = np.arange(np.min(log_freq), np.max(log_freq), 0.1)
+ 
+        # -- Draw 1000 random posterior samples to visualise uncertainty
+        inds = np.random.randint(len(flat_samples_2pl), size=1000)
+ 
+        for ind in inds:
+            sample = flat_samples_2pl[ind]
+            ax.plot(x_sample, power_law_spectrum_2d(
+                x_sample, sample[0], sample[1], sample[2], sample[3]
+            ), "C4", alpha=0.01)
+
+		# -- Overlay median parameter model
+        ax.plot(x_sample, power_law_spectrum_2d(
+            x_sample,
+            soln_log_2powlaw_EMCEE[0], soln_log_2powlaw_EMCEE[1],
+            soln_log_2powlaw_EMCEE[2], soln_log_2powlaw_EMCEE[3]
+        ), "k--", label='Double Power-law')
+ 
+        ax.set_xlabel(r'log (Frequency / GHz)')
+        ax.set_ylabel(r'log ($F_\nu$ / mJy)')
+        ax.invert_xaxis()
+ 
+        # -- Annotate plot with median spectral indices and uncertainties
+        param_inds = [0, 1, 2, 3]
+ 
+        for i in param_inds:
+ 
+            mcmc = np.percentile(flat_samples_2pl[:, i], [16, 50, 84])
+            q = np.diff(mcmc)
+            txt = r"{3} = ${0:.2f}_{{-{1:.2f}}}^{{{2:.2f}}}$"
+            txt = txt.format(mcmc[1], q[0], q[1], labels[i])
+ 
+            if i == param_inds[1]:
+                ax.text(1.7, 1, txt, horizontalalignment='left')
+                a_ion = mcmc[1]
+                a_ion16 = q[0]
+                a_ion84 = q[1]
+ 
+            elif i == param_inds[-1]:
+                ax.text(1.7, 1.5, txt, horizontalalignment='left')
+                a_dust = mcmc[1]
+                a_dust16 = q[0]
+                a_dust84 = q[1]
+ 
+            elif i == param_inds[0]:
+                A1 = mcmc[1]
+ 
+            else:
+                A2 = mcmc[1]
+ 
+        out = np.row_stack((out, (obj, a_dust16, a_dust, a_dust84, A1, a_ion16, a_ion, a_ion84, A2)))
+ 
+        fig.savefig(obj + '_posterior_realisations.pdf', bbox_inches='tight')
+        fig.savefig(obj + '_posterior_realisations.jpg', bbox_inches='tight')
+ 
+    # -------------------------------------------------------------------------
+    # Compile and save spectral index results for all objects
+    # -------------------------------------------------------------------------
+ 
+    # -- Remove the initialising zero row
+    out = np.delete(out, 0, 0)
+ 
+    cols = ["Object", "a_dust16", "a_dust", "a_dust84", "A1", "a_ion16", "a_ion", "a_ion84", "A2"]
+ 
+    out = pd.DataFrame(out, columns=cols)
+    out.to_csv(outfile, index=False)
+ 
+ 
+if __name__ == "__main__":
+    main()
